@@ -1,0 +1,83 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  DEPLOY_USER: kinfrontend
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to server
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+          SSH="ssh -i $HOME/.ssh/id_deploy -o IdentitiesOnly=yes $DEPLOY_USER@$SERVER_HOST"
+
+          printf '%s' "$GHCR_TOKEN" | $SSH "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+          $SSH "cd ~/stack \
+            && sed -i 's|^FRONTEND_IMAGE=.*|FRONTEND_IMAGE=${IMAGE}:${GITHUB_SHA}|' .env \
+            && docker compose pull frontend \
+            && docker compose up -d frontend \
+            && docker image prune -f \
+            && docker logout ghcr.io"
+
+          echo "Waiting for the new container to report healthy..."
+          for i in $(seq 1 24); do
+            status=$($SSH "docker inspect --format '{{.State.Health.Status}}' kin-frontend" || true)
+            echo "  status: $status"
+            [ "$status" = "healthy" ] && exit 0
+            sleep 5
+          done
+          echo "Container did not become healthy" >&2
+          $SSH "docker logs --tail 50 kin-frontend" || true
+          exit 1
+
+      - name: Check the public site (warning only)
+        run: |
+          curl -fsS --retry 6 --retry-delay 5 --retry-connrefused https://bykin.in/healthz \
+            || echo "::warning::bykin.in did not answer yet. Check DNS and the Caddy logs."
